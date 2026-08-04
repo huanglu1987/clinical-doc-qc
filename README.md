@@ -70,7 +70,24 @@ IND / NDA 各模块，以及任何需要前后一致的申报文件。
 - Python 3.8+
 - Codex CLI 或 Claude Code
 
-### 一键安装
+### 方式一：让 Codex 自己装（推荐，不用敲命令）
+
+在 Codex 对话框里发这一句就行：
+
+```
+请帮我安装这个链接下的 SKILL：https://github.com/huanglu1987/clinical-doc-qc
+```
+
+Codex 会自己 clone 仓库、读 README 和 `install.sh`，把 Skill 和三个 Python 依赖一起装好。
+装完再发一句验证：
+
+```
+验证 clinical-doc-qc 是否安装成功
+```
+
+能看到 `docqc.py` 的帮助信息就说明装好了。
+
+### 方式二：自己跑安装脚本
 
 ```bash
 git clone https://github.com/huanglu1987/clinical-doc-qc.git
@@ -80,7 +97,7 @@ bash install.sh
 
 `install.sh` 会做三件事：安装 Python 依赖 → 把 Skill 复制到 `~/.codex/skills/clinical-doc-qc/` → 跑一次自检。
 
-### 手动安装
+### 方式三：完全手动
 
 ```bash
 pip3 install python-docx pypdf pymupdf
@@ -88,7 +105,7 @@ mkdir -p ~/.codex/skills
 cp -r clinical-doc-qc ~/.codex/skills/
 ```
 
-Claude Code 用户把目标路径换成 `~/.claude/skills/`。
+Claude Code 用户把目标路径换成 `~/.claude/skills/`，或用 `bash install.sh --claude`。
 
 ### 验证安装
 
