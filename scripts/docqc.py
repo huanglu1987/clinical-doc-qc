@@ -257,6 +257,97 @@ def _abbr_defs_in(text):
     return out
 
 
+# ── 目录（TOC）提取 ──────────────────────────────────────────
+RE_TOC_STYLE = re.compile(r"^(toc|目录)\s*\d*$", re.I)
+# "1 研究背景........5" / "1 研究背景\t5" / "1 研究背景   5"
+RE_TOC_LINE = re.compile(r"^(.+?)[\s.．·……\t]{2,}(\d{1,4})\s*$")
+
+
+def _norm_title(s):
+    return re.sub(r"[\s.．·……]+", "", (s or "")).strip()
+
+
+def _extract_toc_docx(doc):
+    """从 .docx 抽取目录条目。
+
+    ⚠ 关键：.docx 里目录的页码是**域的缓存值**，Word 打开或转 PDF 时会重算。
+    未渲染状态下读到的数字可能早已过期，**据此判定"页码错误"是不可靠的**。
+    因此这里只把页码原样带出来标为 stale（供人工参考），判定交给标题比对。
+    """
+    entries = []
+    for p in doc.paragraphs:
+        sname = p.style.name if p.style is not None else ""
+        if not RE_TOC_STYLE.match(sname or ""):
+            continue
+        raw = p.text.strip()
+        if not raw:
+            continue
+        title, page = raw, None
+        if "\t" in raw:
+            parts = [x for x in raw.split("\t") if x.strip()]
+            if len(parts) >= 2 and parts[-1].strip().isdigit():
+                title, page = "\t".join(parts[:-1]).strip(), int(parts[-1].strip())
+        if page is None:
+            m = RE_TOC_LINE.match(raw)
+            if m:
+                title, page = m.group(1).strip(), int(m.group(2))
+        lvl = "".join(ch for ch in sname if ch.isdigit())
+        entries.append({"title": title, "cached_page": page,
+                        "level": int(lvl) if lvl.isdigit() else None})
+    return entries
+
+
+def _extract_toc_pdf(fdoc, max_entries=80):
+    """从 PDF 抽取「印在纸面上的目录」，并定位每个标题实际出现在第几页。
+
+    PDF 已渲染，页码是实的，因此这里可以真正比对。
+    注意正文页码与 PDF 物理页序常有固定偏移（封面/扉页），
+    所以采用「众数偏移」判定：只报偏离众数的条目，不把整体偏移当错误。
+    """
+    toc_pages, entries = [], []
+    scan = min(len(fdoc), 12)
+    for pno in range(scan):
+        lines = [l.strip() for l in (fdoc[pno].get_text("text") or "").splitlines() if l.strip()]
+        hits = [l for l in lines if RE_TOC_LINE.match(l)]
+        if len(hits) >= 4:                     # 一页里有 4 行以上「标题…页码」才算目录页
+            toc_pages.append(pno)
+            for l in hits:
+                m = RE_TOC_LINE.match(l)
+                entries.append({"title": m.group(1).strip(), "stated_page": int(m.group(2))})
+    if not entries:
+        return {"found": False, "entries": [], "toc_physical_pages": []}
+
+    entries = entries[:max_entries]
+    body_start = max(toc_pages) + 1 if toc_pages else 0
+    for e in entries:
+        needle = e["title"]
+        if len(needle) < 3:
+            e["actual_physical_page"] = None
+            continue
+        found = None
+        for pno in range(body_start, len(fdoc)):
+            try:
+                if fdoc[pno].search_for(needle[:60], quads=False):
+                    found = pno + 1            # 1-based 物理页
+                    break
+            except Exception:
+                break
+        e["actual_physical_page"] = found
+
+    offs = [e["actual_physical_page"] - e["stated_page"]
+            for e in entries if e.get("actual_physical_page")]
+    modal = Counter(offs).most_common(1)[0][0] if offs else None
+    for e in entries:
+        ap = e.get("actual_physical_page")
+        e["offset"] = (ap - e["stated_page"]) if ap else None
+        e["deviates"] = bool(modal is not None and e["offset"] is not None
+                             and e["offset"] != modal)
+    return {"found": True, "entries": entries,
+            "toc_physical_pages": [p + 1 for p in toc_pages],
+            "modal_offset": modal,
+            "resolved": sum(1 for e in entries if e.get("actual_physical_page"))}
+
+
 def _dedupe_fullnames(fulls):
     """归并同一缩写的多个候选全称。
 
@@ -430,6 +521,7 @@ def extract_docx(path):
                    "size_pt_by_chars": sorted(tbl_sizes.items(), key=lambda x: -x[1]),
                    "min_size_pt": min(tbl_sizes) if tbl_sizes else None},
         "structure": _analyze_structure(paras_text),
+        "toc": {"entries": _extract_toc_docx(doc), "page_numbers_verifiable": False},
         "body_chars": body_chars,
     }
 
@@ -488,6 +580,10 @@ def extract_pdf(path):
         return out
 
     d = fitz.open(path)
+    try:
+        out["toc"] = dict(_extract_toc_pdf(d), page_numbers_verifiable=True)
+    except Exception:
+        out["toc"] = {"found": False, "entries": [], "page_numbers_verifiable": True}
     fonts, sizes, dims = Counter(), Counter(), Counter()
     emb = {"embedded": 0, "not_embedded": 0}
     margins, text_chars = [], 0
@@ -557,6 +653,73 @@ def extract(path):
 #  结构层一致性（单文件内部，CDE / FDA 通用）
 # ══════════════════════════════════════════════════════════════
 
+def _check_toc(d):
+    """目录与正文一致性。
+
+    ⚠ .docx 与 .pdf 能判的东西不同，必须分开处理：
+      - .docx：目录页码是域的缓存值，未渲染时读到的可能早已过期。
+               据此报"页码错误"会得出与事实相反的结论（本项目方法论第 8 条的真实反例）。
+               因此 docx 只比对标题，页码一律不判，改为提示转 PDF 后复核。
+      - .pdf ：页码是实的，可以真正比对；但正文页码与物理页序常有固定偏移
+               （封面/扉页），故按"众数偏移"判定，只报偏离众数的条目。
+    """
+    f = []
+    add = lambda lv, item, msg, fact=None: f.append(
+        {"level": lv, "item": item, "message": msg, "fact": fact})
+    toc = d.get("toc") or {}
+    entries = toc.get("entries") or []
+    if not entries:
+        return f
+
+    # ── 标题比对（两种格式都能做）──
+    if d["type"] == "docx":
+        heads = {_norm_title(h["text"]) for h in (d.get("headings", {}).get("items") or [])}
+        if heads:
+            missing = [e["title"] for e in entries
+                       if _norm_title(e["title"]) and _norm_title(e["title"]) not in heads]
+            if missing:
+                add("ERROR", "目录与正文标题不符",
+                    f"目录中有 {len(missing)} 条在正文标题里找不到对应项："
+                    f"{'；'.join(missing[:5])}{' 等' if len(missing) > 5 else ''}",
+                    missing[:5])
+            toc_set = {_norm_title(e["title"]) for e in entries}
+            absent = [h["text"] for h in (d.get("headings", {}).get("items") or [])
+                      if h.get("level") in (1, 2) and _norm_title(h["text"]) not in toc_set]
+            if absent:
+                add("WARN", "正文标题未进目录",
+                    f"{len(absent)} 个一/二级标题未出现在目录中："
+                    f"{'；'.join(absent[:5])}{' 等' if len(absent) > 5 else ''}；"
+                    f"通常是目录未更新（在 Word 里右键目录→更新域→更新整个目录）",
+                    absent[:5])
+
+        cached = [e for e in entries if e.get("cached_page") is not None]
+        if cached:
+            add("MANUAL", "目录页码（无法自动判定）",
+                f"已读到 {len(cached)} 条目录页码，但 .docx 里页码是域的缓存值、"
+                f"Word 打开或转 PDF 时会重算，未渲染状态下判定页码对错不可靠。"
+                f"请在 Word 中「更新整个目录」后导出 PDF，再对 PDF 跑一次本工具核对页码。",
+                len(cached))
+
+    # ── 页码比对（仅 PDF）──
+    else:
+        dev = [e for e in entries if e.get("deviates")]
+        unresolved = [e for e in entries if not e.get("actual_physical_page")]
+        if dev:
+            desc = "；".join(
+                f"「{e['title'][:24]}」目录标 {e['stated_page']} 页、"
+                f"实际在第 {e['actual_physical_page']} 页" for e in dev[:5])
+            add("ERROR", "目录页码与正文不符",
+                f"{len(dev)} 条目录页码偏离整体偏移（整体偏移 {toc.get('modal_offset')} 页）：{desc}",
+                [e["title"] for e in dev[:5]])
+        if unresolved:
+            add("WARN", "目录条目未能定位",
+                f"{len(unresolved)} 条目录标题在正文中未检索到，可能是标题措辞与目录不一致，"
+                f"或跨页断行导致匹配失败，需人工确认："
+                f"{'；'.join(e['title'][:24] for e in unresolved[:5])}",
+                [e["title"] for e in unresolved[:5]])
+    return f
+
+
 def check_structure(d):
     f = []
     add = lambda lv, item, msg, fact=None: f.append(
@@ -612,7 +775,10 @@ def check_structure(d):
             f"以下缩写多次出现但全文未见「全称（缩写）」式定义：{show}；请确认首次出现处是否已定义",
             [a for a, _ in undef[:8]])
 
-    # ⑤ 标题层级跳级
+    # ⑤ 目录与正文一致性
+    f += _check_toc(d)
+
+    # ⑥ 标题层级跳级
     for sk in (d.get("headings", {}).get("level_skips") or [])[:5]:
         add("WARN", "标题层级跳级",
             f"从 H{sk['from']} 直接跳到 H{sk['to']}：「{sk['text']}」", sk)
