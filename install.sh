@@ -58,10 +58,12 @@ cat <<EOF
   python3 $DEST/scripts/docqc.py check 方案.docx --profile cde
   python3 $DEST/scripts/docqc.py check protocol.docx --profile fda
 
-在 Codex / Claude Code 里直接说：
-  用 clinical-doc-qc 按 CDE 规则审核这套资料：<文件路径...>
+在 Codex / Claude Code 里用自然语言描述需求即可，例如：
+  用 clinical-doc-qc 核查以下这套申报资料，递交去向 CDE、中文资料：<文件路径...>
+更多示例提示词见 README.md 的「怎么用」一节。
 
-正式提交的材料，记得按 templates/review-prompt.md 做双通道核查
-（两个互不共享历史的会话各跑一遍再合并，实测 30 条发现只有 1 条重合）。
+正式提交的材料，记得按 templates/review-prompt.md 做双通道核查：
+在两个互不共享历史的会话里各跑一遍再合并——实测两份独立报告共 30 条发现，
+两边都查出来的只有 1 条，单独跑一轮会漏掉另一轮能找到的绝大部分问题。
 ════════════════════════════════════════════════════════════
 EOF
