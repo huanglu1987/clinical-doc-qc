@@ -348,6 +348,115 @@ def _extract_toc_pdf(fdoc, max_entries=80):
             "resolved": sum(1 for e in entries if e.get("actual_physical_page"))}
 
 
+# ── 编辑痕迹与排版细节（定稿前校对高发项）──────────────────
+RE_FIELD_ERR = re.compile(
+    r"错误[!！]\s*未找到引用源|错误[!！]\s*超链接引用无效|"
+    r"Error!\s*Reference source not found|Error!\s*Bookmark not defined", re.I)
+RE_HALF_PUNCT = re.compile(r"[一-鿿]\s*([,;!?])")          # 中文字后紧跟半角标点
+RE_DATE_STYLES = {
+    "YYYY-MM-DD": re.compile(r"\d{4}-\d{1,2}-\d{1,2}"),
+    "YYYY年M月D日": re.compile(r"\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日"),
+    "YYYY.MM.DD": re.compile(r"\d{4}\.\d{1,2}\.\d{1,2}"),
+    "YYYY/MM/DD": re.compile(r"\d{4}/\d{1,2}/\d{1,2}"),
+    "DD/MM/YYYY 或 MM/DD/YYYY": re.compile(r"(?<!\d)\d{1,2}/\d{1,2}/\d{2,4}"),
+}
+
+
+def _extract_editorial(doc, path):
+    """抽取定稿前最该查、但肉眼最容易漏的几类问题。"""
+    from docx.oxml.ns import qn
+    out = {}
+
+    # ① 修订痕迹（发出去带修订痕迹属于事故）
+    body = doc.element.body
+    cnt = lambda tag: len(body.findall(".//" + qn(tag)))
+    out["tracked_changes"] = {
+        "insertions": cnt("w:ins"), "deletions": cnt("w:del"),
+        "moves": cnt("w:moveFrom") + cnt("w:moveTo"),
+        "format_changes": cnt("w:rPrChange") + cnt("w:pPrChange"),
+    }
+
+    # ② 批注残留
+    ncom = 0
+    try:
+        import zipfile
+        with zipfile.ZipFile(path) as z:
+            if "word/comments.xml" in z.namelist():
+                ncom = z.read("word/comments.xml").decode("utf-8", "ignore").count("<w:comment ")
+    except Exception:
+        pass
+    out["comments"] = ncom
+
+    # ③ 页眉页脚（版本号/方案编号改了但页眉没改，是高发问题）
+    heads, foots = [], []
+    for s in doc.sections:
+        try:
+            heads.append(" / ".join(p.text.strip() for p in s.header.paragraphs if p.text.strip()))
+            foots.append(" / ".join(p.text.strip() for p in s.footer.paragraphs if p.text.strip()))
+        except Exception:
+            pass
+    out["headers"] = heads
+    out["footers"] = foots
+
+    # ④ 空段落与空表格单元格（结构性编辑后的残留）
+    empties, run = 0, 0
+    for p in doc.paragraphs:
+        if p.text.strip():
+            run = 0
+        else:
+            run += 1
+            if run >= 2:
+                empties += 1
+    empty_cells = 0
+    for t in doc.tables:
+        for row in t.rows:
+            for c in row.cells:
+                if not c.text.strip():
+                    empty_cells += 1
+    out["consecutive_empty_paragraphs"] = empties
+    out["empty_table_cells"] = empty_cells
+
+    # ⑤ 文档属性（可能带出上一版作者/单位信息）
+    try:
+        cp = doc.core_properties
+        out["properties"] = {"author": cp.author or None,
+                             "last_modified_by": cp.last_modified_by or None,
+                             "title": cp.title or None,
+                             "category": cp.category or None}
+    except Exception:
+        out["properties"] = {}
+    return out
+
+
+def _scan_text_issues(paras_text, is_cjk_doc):
+    """纯文本层面的排版细节：域错误、日期格式混用、半角标点、括号配对。"""
+    out = {"field_errors": [], "date_styles": {}, "half_punct": [], "unbalanced": []}
+    for t in paras_text:
+        if not t:
+            continue
+        if RE_FIELD_ERR.search(t):
+            out["field_errors"].append(t[:60])
+        if is_cjk_doc:
+            # 同一段里多处命中只记一条，避免上下文窗口重叠、输出刷屏
+            marks = RE_HALF_PUNCT.findall(t)
+            if marks:
+                out["half_punct"].append(
+                    {"text": t[:60], "marks": "".join(sorted(set(marks))), "count": len(marks)})
+        for pair, (l, r) in {"（）": ("（", "）"), "()": ("(", ")"),
+                             "【】": ("【", "】")}.items():
+            if t.count(l) != t.count(r):
+                out["unbalanced"].append({"pair": pair, "text": t[:60]})
+    joined = "\n".join(paras_text)
+    for name, rx in RE_DATE_STYLES.items():
+        n = len(rx.findall(joined))
+        if n:
+            out["date_styles"][name] = n
+    out["field_errors"] = out["field_errors"][:10]
+    out["half_punct"] = out["half_punct"][:10]
+    out["unbalanced"] = out["unbalanced"][:10]
+    return out
+
+
 def _dedupe_fullnames(fulls):
     """归并同一缩写的多个候选全称。
 
@@ -522,6 +631,8 @@ def extract_docx(path):
                    "min_size_pt": min(tbl_sizes) if tbl_sizes else None},
         "structure": _analyze_structure(paras_text),
         "toc": {"entries": _extract_toc_docx(doc), "page_numbers_verifiable": False},
+        "editorial": dict(_extract_editorial(doc, path),
+                          **_scan_text_issues(paras_text, cjk)),
         "body_chars": body_chars,
     }
 
@@ -635,6 +746,7 @@ def extract_pdf(path):
     out["text_chars"] = text_chars
     out["language"] = "zh" if any(_has_cjk(t) for t in paras_text[:400]) else "en"
     out["structure"] = _analyze_structure(paras_text)
+    out["editorial"] = _scan_text_issues(paras_text, out["language"] == "zh")
     return out
 
 
@@ -720,6 +832,87 @@ def _check_toc(d):
     return f
 
 
+def check_editorial(d):
+    """定稿前校对项：修订痕迹、批注、页眉页脚、域错误、日期格式、标点。"""
+    f = []
+    add = lambda lv, item, msg, fact=None: f.append(
+        {"level": lv, "item": item, "message": msg, "fact": fact})
+    ed = d.get("editorial") or {}
+
+    # ① 修订痕迹与批注 —— 带着这些发出去属于事故，级别最高
+    tc = ed.get("tracked_changes") or {}
+    tot = sum(v for v in tc.values() if isinstance(v, int))
+    if tot:
+        detail = "、".join(f"{k}{v}处" for k, v in
+                          (("插入", tc.get("insertions", 0)), ("删除", tc.get("deletions", 0)),
+                           ("移动", tc.get("moves", 0)), ("格式修订", tc.get("format_changes", 0)))
+                          if v)
+        add("ERROR", "残留修订痕迹",
+            f"文档仍带有未接受的修订痕迹（{detail}）。定稿前必须「接受所有修订」并关闭修订模式，"
+            f"否则接收方会看到全部修改历史", tc)
+    if ed.get("comments"):
+        add("ERROR", "残留批注",
+            f"文档中还有 {ed['comments']} 条批注未删除，定稿前应清除", ed["comments"])
+
+    # ② 域代码错误（目录/交叉引用失效后会直接印在纸面上）
+    fe = ed.get("field_errors") or []
+    if fe:
+        add("ERROR", "域代码错误残留",
+            f"检出 {len(fe)} 处「未找到引用源」类错误文本，说明交叉引用或书签已失效："
+            f"{'；'.join(x[:30] for x in fe[:3])}", fe[:3])
+
+    # ③ 页眉页脚一致性（版本号/编号改了但页眉没改，是高发问题）
+    for key, label in (("headers", "页眉"), ("footers", "页脚")):
+        vals = [v for v in (ed.get(key) or []) if v]
+        if len(set(vals)) > 1:
+            add("WARN", f"{label}不一致",
+                f"各节{label}内容不同（{len(set(vals))} 种）：{'；'.join(sorted(set(vals))[:3])}；"
+                f"请确认是否有意为之（改版本号时常漏改其中一处）", sorted(set(vals))[:3])
+
+    # ④ 日期格式混用
+    ds = ed.get("date_styles") or {}
+    if len(ds) > 1:
+        add("WARN", "日期格式不统一",
+            f"全文混用 {len(ds)} 种日期写法："
+            f"{'、'.join(f'{k}({v}处)' for k, v in sorted(ds.items(), key=lambda x: -x[1]))}", ds)
+
+    # ⑤ 中文文档里的半角标点
+    hp = ed.get("half_punct") or []
+    if hp:
+        n = sum(x.get("count", 1) for x in hp)
+        samples = "；".join("{}[{}]".format(x["text"][:26], x["marks"]) for x in hp[:3])
+        add("WARN", "中文句中使用半角标点",
+            f"{len(hp)} 个段落共 {n} 处中文字后紧跟半角标点（应改用全角）：{samples}", hp[:3])
+
+    # ⑥ 括号不配对
+    ub = ed.get("unbalanced") or []
+    if ub:
+        add("WARN", "括号不配对",
+            f"检出 {len(ub)} 处括号数量不匹配："
+            f"{'；'.join(x['text'][:28] for x in ub[:3])}", ub[:3])
+
+    # ⑦ 空段落 / 空单元格（结构性编辑残留，方法论第四节）
+    if ed.get("consecutive_empty_paragraphs", 0) >= 3:
+        add("WARN", "连续空段落",
+            f"检出 {ed['consecutive_empty_paragraphs']} 处连续空段落，"
+            f"通常是删段后留下的空壳，带列表样式时会渲染成空的项目符号",
+            ed["consecutive_empty_paragraphs"])
+    if ed.get("empty_table_cells", 0):
+        n = ed["empty_table_cells"]
+        add("WARN" if n >= 5 else "MANUAL", "表格空单元格",
+            f"表格中有 {n} 个空单元格；申报资料中空值一般应写「NA」或「不适用」而非留空", n)
+
+    # ⑧ 文档属性（可能带出上一版作者/单位）
+    props = ed.get("properties") or {}
+    who = [f"{k}={v}" for k, v in (("作者", props.get("author")),
+                                   ("最后修改人", props.get("last_modified_by"))) if v]
+    if who:
+        add("MANUAL", "文档属性",
+            f"文档属性中记录了 {'、'.join(who)}；对外递交前请确认是否需要清除"
+            f"（Word：文件→信息→检查问题→检查文档）", props)
+    return f
+
+
 def check_structure(d):
     f = []
     add = lambda lv, item, msg, fact=None: f.append(
@@ -777,6 +970,9 @@ def check_structure(d):
 
     # ⑤ 目录与正文一致性
     f += _check_toc(d)
+
+    # ⑤之二 编辑痕迹与排版细节
+    f += check_editorial(d)
 
     # ⑥ 标题层级跳级
     for sk in (d.get("headings", {}).get("level_skips") or [])[:5]:
